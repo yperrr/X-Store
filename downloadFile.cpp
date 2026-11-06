@@ -1314,7 +1314,8 @@ static HttpResponseInfo HTTP_GET_or_POST(
         }
         else
         {
-            // XboxTLS_Read also reports connection closure with a negative return value.
+            // XboxTLS_Read returns 0 when the server closes with close_notify,
+            // and a negative value on a TLS or socket error.
             response.body.swap(reader.pending);
             char buffer[4096];
             int received;

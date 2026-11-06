@@ -63,7 +63,6 @@
 // Xbox 360-specific socket option required for direct outbound sockets that do
 // not tunnel through Microsoft's service stack.
 #define XBOX_SO_BYPASS_SECURITY 0x5801
-static br_hmac_drbg_context g_drbg;
 
 extern "C" void XeCryptRandom(BYTE* pb, DWORD cb);
 
@@ -71,9 +70,12 @@ extern "C" void XeCryptRandom(BYTE* pb, DWORD cb);
 /*
  * Custom entropy seeder for XboxTLS.
  *
- * This function provides entropy to the BearSSL HMAC-DRBG (Deterministic Random Bit Generator)
- * using the Xbox 360's internal XeCryptRandom function. It seeds the global HMAC-DRBG instance
- * `g_drbg` with a 32-byte random seed and sets the context pointer for use in TLS operations.
+ * BearSSL calls this with a pointer to the engine's own PRNG (an HMAC-DRBG
+ * that rng_init() created with an empty seed). The seeder must inject entropy
+ * into that PRNG through its update() method. Initialising a separate DRBG
+ * and only copying its vtable pointer (as this function used to do) leaves the
+ * engine PRNG unseeded: every connection would then use the same client random
+ * and the same ECDHE private key, which makes the traffic decryptable.
  *
  * Returns:
  *   1 on success (as required by BearSSL API).
@@ -81,8 +83,11 @@ extern "C" void XeCryptRandom(BYTE* pb, DWORD cb);
 static int XboxTLS_CustomSeeder(const br_prng_class **ctx) {
     unsigned char seed[32];
     XeCryptRandom(seed, sizeof(seed));
-    br_hmac_drbg_init(&g_drbg, &br_sha256_vtable, seed, sizeof(seed));
-    *ctx = g_drbg.vtable;
+    (*ctx)->update(ctx, seed, sizeof(seed));
+
+    volatile unsigned char *wipe = seed;
+    for (size_t i = 0; i < sizeof(seed); ++i)
+        wipe[i] = 0;
     return 1;
 }
 br_prng_seeder
@@ -185,6 +190,48 @@ static int tls_socket_read(void* ctx, unsigned char* buf, size_t len) {
 static int tls_socket_write(void* ctx, const unsigned char* buf, size_t len) {
     SOCKET s = *(SOCKET*)ctx;
     return send(s, (const char*)buf, (int)len, 0);
+}
+
+/*
+ * Formats a BearSSL error code as "<code> (<name>)" for the debug log.
+ * Error 0 (BR_ERR_OK) on a failed read or write is not an error: the engine
+ * stopped cleanly, usually because the server sent close_notify.
+ */
+static void XboxTLS_DescribeError(int err, char* out, size_t outSize) {
+    const char* name = NULL;
+
+    switch (err) {
+        case BR_ERR_OK:                    name = "no error, connection closed cleanly"; break;
+        case BR_ERR_BAD_PARAM:             name = "bad parameter"; break;
+        case BR_ERR_BAD_STATE:             name = "bad state"; break;
+        case BR_ERR_UNSUPPORTED_VERSION:   name = "server does not support TLS 1.2"; break;
+        case BR_ERR_BAD_VERSION:           name = "bad protocol version"; break;
+        case BR_ERR_BAD_MAC:               name = "bad record MAC"; break;
+        case BR_ERR_NO_RANDOM:             name = "no entropy for the PRNG"; break;
+        case BR_ERR_UNEXPECTED:            name = "unexpected message"; break;
+        case BR_ERR_BAD_HANDSHAKE:         name = "bad handshake message"; break;
+        case BR_ERR_BAD_CIPHER_SUITE:      name = "no shared cipher suite"; break;
+        case BR_ERR_BAD_SNI:               name = "bad server name"; break;
+        case BR_ERR_BAD_SIGNATURE:         name = "bad server signature"; break;
+        case BR_ERR_IO:                    name = "socket error or connection closed without close_notify"; break;
+        case BR_ERR_X509_EXPIRED:          name = "certificate expired or not yet valid (check the console clock)"; break;
+        case BR_ERR_X509_TIME_UNKNOWN:     name = "certificate validity could not be checked (console clock unknown)"; break;
+        case BR_ERR_X509_BAD_SERVER_NAME:  name = "certificate does not match the server name"; break;
+        case BR_ERR_X509_NOT_TRUSTED:      name = "certificate chain not trusted (missing trust anchor)"; break;
+        case BR_ERR_X509_EMPTY_CHAIN:      name = "server sent no certificate"; break;
+        default: break;
+    }
+
+    if (name != NULL) {
+        _snprintf(out, outSize, "%d (%s)", err, name);
+    } else if (err >= BR_ERR_SEND_FATAL_ALERT) {
+        _snprintf(out, outSize, "%d (fatal alert %d sent to the server)", err, err - BR_ERR_SEND_FATAL_ALERT);
+    } else if (err >= BR_ERR_RECV_FATAL_ALERT) {
+        _snprintf(out, outSize, "%d (fatal alert %d received from the server)", err, err - BR_ERR_RECV_FATAL_ALERT);
+    } else {
+        _snprintf(out, outSize, "%d", err);
+    }
+    out[outSize - 1] = '\0';
 }
 
 static void XboxTLS_SetSocketOptions(SOCKET sock) {
@@ -489,7 +536,22 @@ bool XboxTLS_Connect(XboxTLSContext* ctx, const char* ip, const char* hostname, 
         br_ssl_client_init_full(&ic->sc, &ic->xc, ic->anchors, ic->anchor_count);
         XboxTLS_UseFastDownloadSuites(&ic->sc);
         br_ssl_engine_set_buffer(&ic->sc.eng, ic->iobuf, sizeof(ic->iobuf), 1);
-        br_ssl_client_reset(&ic->sc, hostname, 0);
+
+        // A failed reset (no entropy, hostname too long, bad buffer) leaves the
+        // engine closed; without this check the first write then failed with a
+        // confusing "error code: 0".
+        if (!br_ssl_client_reset(&ic->sc, hostname, 0)) {
+            char errBuf[128];
+            char msg[192];
+            XboxTLS_DescribeError(br_ssl_engine_last_error(&ic->sc.eng), errBuf, sizeof(errBuf));
+            _snprintf(msg, sizeof(msg), "TLS client reset failed: %s", errBuf);
+            msg[sizeof(msg) - 1] = '\0';
+            debug_tls(msg);
+            closesocket(sock);
+            ic->sock = INVALID_SOCKET;
+            return false;
+        }
+
         br_sslio_init(&ic->ioc, &ic->sc.eng, tls_socket_read, &ic->sock, tls_socket_write, &ic->sock);
         printf("Connect: TLS init OK\n");
 
@@ -527,6 +589,43 @@ bool XboxTLS_Connect(XboxTLSContext* ctx, const char* ip, const char* hostname, 
  *   - Always flushes the stream after writing.
  *   - Uses BearSSL’s `br_sslio_write_all` and `br_sslio_flush`.
  */
+/*
+ * Decides what a failed br_sslio_write_all/br_sslio_flush means.
+ *
+ * With error code 0 (BR_ERR_OK) BearSSL did not fail, it stopped:
+ *   - BR_SSL_RECVAPP: the server already sent response data (for example an
+ *     HTTP 401/413 before the request body was fully sent). The shared
+ *     in/out buffer cannot send more until that data is read, so the request
+ *     is reported as written and the caller goes on to read the response.
+ *   - BR_SSL_CLOSED: the server closed the connection with close_notify.
+ * Any other code is a real TLS or socket error.
+ *
+ * Returns len when the caller should read the response, -1 otherwise.
+ */
+static int XboxTLS_HandleWriteFailure(XboxTLSInternal* ic, const char* step, int len) {
+    int err = br_ssl_engine_last_error(&ic->sc.eng);
+    unsigned state = br_ssl_engine_current_state(&ic->sc.eng);
+    char errBuf[128];
+    char msg[256];
+
+    if (err == BR_ERR_OK && (state & BR_SSL_RECVAPP)) {
+        _snprintf(msg, sizeof(msg), "TLS %s: server answered before the request was fully sent; reading its response", step);
+        msg[sizeof(msg) - 1] = '\0';
+        debug_tls(msg);
+        return len;
+    }
+
+    if (err == BR_ERR_OK) {
+        _snprintf(msg, sizeof(msg), "TLS %s failed: the server closed the connection", step);
+    } else {
+        XboxTLS_DescribeError(err, errBuf, sizeof(errBuf));
+        _snprintf(msg, sizeof(msg), "TLS %s error code: %s", step, errBuf);
+    }
+    msg[sizeof(msg) - 1] = '\0';
+    debug_tls(msg);
+    return -1;
+}
+
 int XboxTLS_Write(XboxTLSContext* ctx, const void* buf, int len) {
     if (!ctx || !ctx->internal || !buf || len <= 0) {
         debug_tls("XboxTLS_Write: Invalid arguments.");
@@ -552,11 +651,7 @@ int XboxTLS_Write(XboxTLSContext* ctx, const void* buf, int len) {
     }
 
     if (writeResult < 0) {
-        int err = br_ssl_engine_last_error(&ic->sc.eng);
-        char msg[64];
-        sprintf(msg, "TLS write error code: %d", err);
-        debug_tls(msg);
-        return -1;
+        return XboxTLS_HandleWriteFailure(ic, "write", len);
     }
     printf("Write: br_sslio_write_all OK\n");
 
@@ -572,11 +667,7 @@ int XboxTLS_Write(XboxTLSContext* ctx, const void* buf, int len) {
     }
 
     if (writeResult != 0) {
-        int err = br_ssl_engine_last_error(&ic->sc.eng);
-        char msg[64];
-        sprintf(msg, "TLS flush error code: %d", err);
-        debug_tls(msg);
-        return -1;
+        return XboxTLS_HandleWriteFailure(ic, "flush", len);
     }
     printf("Write: br_sslio_flush OK\n");
 
@@ -624,8 +715,20 @@ int XboxTLS_Read(XboxTLSContext* ctx, void* buf, int len) {
     int r = br_sslio_read(&ic->ioc, buf, (size_t)len);
     if (r < 0) {
         int err = br_ssl_engine_last_error(&ic->sc.eng);
-        char msg[64];
-        sprintf(msg, "TLS read error code: %d", err);
+
+        // Error 0 means the server sent close_notify: that is the normal end
+        // of a "Connection: close" response, not a failure. Report it as end
+        // of stream so callers stop reading without logging an error; they
+        // still compare the byte count with Content-Length.
+        if (err == BR_ERR_OK) {
+            return 0;
+        }
+
+        char errBuf[128];
+        char msg[192];
+        XboxTLS_DescribeError(err, errBuf, sizeof(errBuf));
+        _snprintf(msg, sizeof(msg), "TLS read error code: %s", errBuf);
+        msg[sizeof(msg) - 1] = '\0';
         debug_tls(msg);
     }
 

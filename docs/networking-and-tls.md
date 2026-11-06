@@ -74,7 +74,9 @@ The caller creates an `XboxTLSContext` on the stack. The internal BearSSL state 
 
 BearSSL expects a PRNG seeder named `br_prng_seeder_system()`. This project supplies one backed by `XeCryptRandom()`.
 
-The seeder fills a 32-byte seed, initializes a global BearSSL HMAC-DRBG using SHA-256, and returns that PRNG to BearSSL.
+BearSSL calls the seeder with a pointer to the engine's own HMAC-DRBG, which `rng_init()` created with an empty seed. The seeder fills a 32-byte seed with `XeCryptRandom()` and injects it into that PRNG with its `update()` method, then wipes the local seed.
+
+Earlier versions initialised a separate global DRBG and only copied its vtable pointer back, which left the engine PRNG unseeded: every connection used the same client random and the same ECDHE private key, so recorded traffic (including Internet Archive logins) could be decrypted. Do not reintroduce that pattern.
 
 ## Trust Anchors
 
@@ -110,7 +112,7 @@ After TCP connect:
 4. `br_ssl_client_init_full()` initializes the client.
 5. `XboxTLS_UseFastDownloadSuites()` pins TLS to TLS 1.2 and supplies a small cipher-suite list.
 6. `br_ssl_engine_set_buffer()` installs the bidirectional TLS buffer.
-7. `br_ssl_client_reset()` sets the hostname for SNI/certificate validation.
+7. `br_ssl_client_reset()` sets the hostname for SNI/certificate validation. Its return value is checked: on failure (no entropy, hostname too long, bad buffer) the connection is aborted with the BearSSL error, instead of failing later with an unexplained code 0.
 8. `br_sslio_init()` wires BearSSL reads/writes to the socket functions.
 
 The selected cipher suites prefer ChaCha20-Poly1305 and AES-128-GCM, with an AES-128-CBC fallback.
@@ -121,7 +123,15 @@ The selected cipher suites prefer ChaCha20-Poly1305 and AES-128-GCM, with an AES
 
 `XboxTLS_Read()` first checks if BearSSL already has received application data available in `br_ssl_engine_recvapp_buf()`. If so, it copies from that internal buffer and acknowledges the bytes. Otherwise it calls `br_sslio_read()`.
 
-On BearSSL errors, TLS error codes are written through `debug_tls()`.
+On BearSSL errors, TLS error codes are written through `debug_tls()` together with their meaning (`XboxTLS_DescribeError()`), for example `31 (socket error or connection closed without close_notify)` or `54 (certificate expired or not yet valid (check the console clock))`.
+
+### Error code 0
+
+`br_ssl_engine_last_error()` returning `0` (`BR_ERR_OK`) after a failed read or write means BearSSL stopped without an error:
+
+- **Read:** the server sent `close_notify`, the normal end of a `Connection: close` response. `XboxTLS_Read()` returns `0` (end of stream) and logs nothing. Callers still compare the received size with `Content-Length`, so a truncated download is still reported.
+- **Write, engine in `BR_SSL_RECVAPP`:** the server answered before the whole request was sent (for example a `401` before a POST body). With the shared in/out buffer BearSSL cannot send more until that data is read, so `XboxTLS_Write()` reports the request as written and the caller reads the response.
+- **Write, engine closed:** the server closed the connection; logged as such and `-1` is returned.
 
 ## Cleanup
 

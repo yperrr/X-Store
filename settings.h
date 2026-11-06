@@ -20,4 +20,16 @@
 
 #define IA_S3_KEYS_FILE_PATH "game:\\ArchiveOrgKeys.txt"
 
+// Download destinations, edited from the Settings menu (ui.cpp) and read by
+// getSettings() (main.cpp). One "key: value" per line, '#' starts a comment.
+#define SETTINGS_FILE_PATH "game:\\settings.txt"
+#define SETTING_ORIGINAL_XBOX_PATH "original-xbox-path: "
+#define SETTING_XBOX_360_PATH "xbox-360-path: "
+#define SETTING_XBLA_PATH "xbla-path: "
+#define SETTING_LEGACY_OUTPUT_PATH "output-path: "
+// Where the archive is downloaded and unpacked before the final copy/extract.
+// Needs about twice the game size in free space. Defaults to the X Store folder.
+#define SETTING_TEMP_PATH "temp-path: "
+#define DEFAULT_TEMP_PATH "game:"
+
 #endif

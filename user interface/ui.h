@@ -120,7 +120,8 @@ enum DownloadType {
     XBLA, 
     AUTO_UPDATE,
     DOWNLOAD_QUEUE,
-    IA_LOGIN
+    IA_LOGIN,
+    SETTINGS_MENU
 };
 
 struct GameData

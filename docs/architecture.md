@@ -37,21 +37,25 @@ The main loop returns success immediately after a successful download/extract. I
 
 ## Settings Model
 
-`main.cpp` defines a local `Settings` struct with four paths:
+`main.cpp` defines a local `Settings` struct with five paths:
 
 - `originalXboxPath`
 - `xbox360Path`
 - `xblaPath`
 - `legacyPath`
+- `tempPath`
 
-`getSettings()` reads `game:\settings.txt` line by line and recognizes:
+`getSettings()` reads `game:\settings.txt` line by line and recognizes (keys are defined in `settings.h`):
 
 - `original-xbox-path: `
 - `xbox-360-path: `
 - `xbla-path: `
+- `temp-path: ` (where `tmp.7z.001` and `tmp_output` are created; defaults to `game:`)
 - `output-path: `
 
-Lines beginning with `#` are skipped. If a type-specific path is missing, the code tries to fall back to the legacy `output-path`. Missing paths are logged but do not stop startup immediately.
+Lines beginning with `#` are skipped, and the last line of a key wins. If a type-specific path is missing, the code tries to fall back to the legacy `output-path`. Missing paths are logged but do not stop startup immediately.
+
+The **Settings: download destinations** entry of the main menu (`ShowSettingsMenu()` in `user interface/ui.cpp`) edits these four keys: the user picks a writable drive (`Hdd:`, `Usb0:`, `Usb1:`, `game:`, with free space shown), then confirms or edits the folder on the keyboard. The path is normalised, validated (drive prefix, FATX name length, forbidden characters), created, tested for write access, then saved. Other lines of `settings.txt`, including comments, are kept.
 
 ## Download Type
 

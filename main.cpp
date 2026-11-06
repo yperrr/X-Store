@@ -35,7 +35,7 @@ DESCRIPTION : READ THE FILE NAME (Haha). This is the main file that coordinates 
 #include "decompressZip.h"
 #include "ia.h"
 
-#define SETTINGS_FILE "game:\\settings.txt"
+#define SETTINGS_FILE SETTINGS_FILE_PATH
 
 struct Settings
 {
@@ -43,6 +43,7 @@ struct Settings
 	char xbox360Path[MAX_TEXT_LENGTH];
 	char xblaPath[MAX_TEXT_LENGTH];
 	char legacyPath[MAX_TEXT_LENGTH];
+	char tempPath[MAX_TEXT_LENGTH];
 };
 
 bool CheckGameMounted()
@@ -523,6 +524,7 @@ struct Settings getSettings()
 	strcpy(settings.xbox360Path, " ");		// default back to where ever the xex file was launched from
 	strcpy(settings.xblaPath, " ");			// default back to where ever the xex file was launched from
 	strcpy(settings.legacyPath, " ");		// default back to where ever the xex file was launched from
+	strcpy(settings.tempPath, " ");
 
 	FILE *fd = fopen(SETTINGS_FILE, "r");
 
@@ -553,11 +555,17 @@ struct Settings getSettings()
 			continue; // comment
 		}
 
-		parseSettings("original-xbox-path: ", buff, settings.originalXboxPath);
-		parseSettings("xbox-360-path: ", buff, settings.xbox360Path);
-		parseSettings("xbla-path: ", buff, settings.xblaPath);
+		parseSettings(SETTING_ORIGINAL_XBOX_PATH, buff, settings.originalXboxPath);
+		parseSettings(SETTING_XBOX_360_PATH, buff, settings.xbox360Path);
+		parseSettings(SETTING_XBLA_PATH, buff, settings.xblaPath);
+		parseSettings(SETTING_TEMP_PATH, buff, settings.tempPath);
 
-		parseSettings("output-path: ", buff, settings.legacyPath);
+		parseSettings(SETTING_LEGACY_OUTPUT_PATH, buff, settings.legacyPath);
+	}
+
+	if (strlen(settings.tempPath) < 3)
+	{
+		strcpy(settings.tempPath, DEFAULT_TEMP_PATH);
 	}
 
 	if (strlen(settings.originalXboxPath) < 3)
@@ -731,13 +739,25 @@ int parseGameData(
 
 	int downloadStatus = -1;
 
+	// The archive and the unpacked ISO go to the temporary folder chosen in
+	// Settings (the X Store folder by default).
+	const std::string tempFolder = removeTrailingSlash(settings.tempPath);
+	if (customForceMkdir(tempFolder.c_str()) != EXIT_SUCCESS)
+	{
+		log_printf("Note: could not create temporary folder %s (it may already exist)\n", tempFolder.c_str());
+	}
+	const std::string compressedFile = tempFolder + "\\tmp.7z.001";
+	const std::string isoFolder = tempFolder + "\\tmp_output";
+
+	dprintf("Temporary files: %s\n", tempFolder.c_str());
+
 	if (gamesData.downloadType == XBLA)
 	{
-		downloadStatus = getGame(std::string(gamesData.selectedGameURL), "game:\\tmp.7z.001", gamesData.outputFolder, settings.xblaPath, gamesData.downloadType, std::string(gamesData.fileFormat));
+		downloadStatus = getGame(std::string(gamesData.selectedGameURL), compressedFile, gamesData.outputFolder, settings.xblaPath, gamesData.downloadType, std::string(gamesData.fileFormat));
 	}
 	else
 	{
-		downloadStatus = getGame(std::string(gamesData.selectedGameURL), "game:\\tmp.7z.001", "game:\\tmp_output", gamesData.outputFolder, gamesData.downloadType, std::string(gamesData.fileFormat));
+		downloadStatus = getGame(std::string(gamesData.selectedGameURL), compressedFile, isoFolder, gamesData.outputFolder, gamesData.downloadType, std::string(gamesData.fileFormat));
 	}
 
 	if (downloadStatus == EXIT_SUCCESS)

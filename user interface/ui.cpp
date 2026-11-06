@@ -56,10 +56,16 @@ static const char *GetDownloadTypeName(enum DownloadType type)
     case IA_LOGIN:
         return "Re-login to the Internet Archive";
 
+    case SETTINGS_MENU:
+        return "Settings: download destinations";
+
     default:
         return "Unknown";
     }
 }
+
+// Number of entries in the main menu (see GetDownloadTypeFromIndex).
+static const int MAIN_MENU_ITEM_COUNT = 7;
 
 static enum DownloadType GetDownloadTypeFromIndex(int index)
 {
@@ -82,6 +88,9 @@ static enum DownloadType GetDownloadTypeFromIndex(int index)
 
     case 5:
         return IA_LOGIN;
+
+    case 6:
+        return SETTINGS_MENU;
 
     default:
         return XBLA;
@@ -201,7 +210,7 @@ static void RenderDownloadTypeMenu(int selected, const std::vector<GameData> &ga
     ClearConsoleOnNextPrint();
     _snprintf(outputTextBuffer, TEXTBUFFER_SIZE - strlen(outputTextBuffer), "Download Queue (%u items)\n\n", (unsigned int)gamesInfo.size());
 
-    for (int i = 0; i < 6; ++i)
+    for (int i = 0; i < MAIN_MENU_ITEM_COUNT; ++i)
     {
         enum DownloadType type = GetDownloadTypeFromIndex(i);
         if (type == DOWNLOAD_QUEUE)
@@ -287,8 +296,8 @@ static enum DownloadType ShowDownloadTypeMenu(const std::vector<GameData> &games
         if (selected < 0)
             selected = 0;
 
-        if (selected >= 6)
-            selected = 5;
+        if (selected >= MAIN_MENU_ITEM_COUNT)
+            selected = MAIN_MENU_ITEM_COUNT - 1;
 
         if (moved)
             RenderDownloadTypeMenu(selected, gamesInfo);
@@ -798,6 +807,428 @@ std::string getURLbyIndex(const int downloadType, const int index) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Settings menu: download destinations
+//
+// Edits game:\settings.txt, the file main.cpp reads in getSettings(). Each
+// destination is chosen in two steps: a drive among the writable ones, then
+// the folder on the keyboard (the folder is created if needed).
+// ---------------------------------------------------------------------------
+
+struct DestinationSetting
+{
+    const char *key;           // line prefix in settings.txt
+    const char *label;         // shown in the menu
+    const char *defaultFolder; // suggested when nothing is set yet
+};
+
+static const DestinationSetting DESTINATION_SETTINGS[] = {
+    {SETTING_ORIGINAL_XBOX_PATH, "Original Xbox games", "\\Games\\Xbox"},
+    {SETTING_XBOX_360_PATH, "Xbox 360 games", "\\Games\\Xbox 360"},
+    {SETTING_XBLA_PATH, "XBLA, DLC and Title Updates", "\\Content\\0000000000000000"},
+    {SETTING_TEMP_PATH, "Temporary download files", "\\X-Store temp"},
+};
+static const int DESTINATION_SETTING_COUNT = sizeof(DESTINATION_SETTINGS) / sizeof(DESTINATION_SETTINGS[0]);
+
+// Same drives as CheckGameMounted() in main.cpp.
+static const char *CANDIDATE_DRIVES[] = {"Hdd:", "Usb0:", "Usb1:", "game:"};
+static const int CANDIDATE_DRIVE_COUNT = sizeof(CANDIDATE_DRIVES) / sizeof(CANDIDATE_DRIVES[0]);
+
+// Longest folder name FATX accepts.
+static const size_t FATX_MAX_NAME_LEN = 42;
+
+static void WaitForAPress()
+{
+    WaitForControllerButtonsRelease();
+
+    XINPUT_STATE state;
+    while (true)
+    {
+        ZeroMemory(&state, sizeof(state));
+        if (XInputGetState(0, &state) == ERROR_SUCCESS && (state.Gamepad.wButtons & XINPUT_GAMEPAD_A))
+            break;
+
+        Sleep(50);
+    }
+
+    WaitForControllerButtonsRelease();
+}
+
+static void RenderSimpleMenu(const char *title, const std::vector<std::string> &items, int selected, const char *footer)
+{
+    char outputTextBuffer[TEXTBUFFER_SIZE] = "";
+
+    ClearConsoleOnNextPrint();
+    _snprintf(outputTextBuffer, TEXTBUFFER_SIZE - 1, "%s\n\n", title);
+
+    for (size_t i = 0; i < items.size(); ++i)
+    {
+        _snprintf(outputTextBuffer + strlen(outputTextBuffer), TEXTBUFFER_SIZE - 1 - strlen(outputTextBuffer), "%c %s\n",
+                  (int)i == selected ? '>' : ' ',
+                  items[i].c_str());
+    }
+
+    _snprintf(outputTextBuffer + strlen(outputTextBuffer), TEXTBUFFER_SIZE - 1 - strlen(outputTextBuffer), "\n%s\n", footer);
+    outputTextBuffer[TEXTBUFFER_SIZE - 1] = '\0';
+
+    dprintf("%s", outputTextBuffer);
+}
+
+// Returns the selected index, or -1 when B is pressed.
+static int ShowSimpleMenu(const char *title, const std::vector<std::string> &items, const char *footer)
+{
+    int selected = 0;
+    WORD previousButtons = 0;
+    int previousDirection = 0;
+    DWORD nextRepeatTick = 0;
+
+    WaitForControllerButtonsRelease();
+    RenderSimpleMenu(title, items, selected, footer);
+    InitializeMenuInput(&previousButtons, &previousDirection, &nextRepeatTick);
+
+    XINPUT_STATE state;
+
+    while (true)
+    {
+        ZeroMemory(&state, sizeof(state));
+
+        if (XInputGetState(0, &state) != ERROR_SUCCESS)
+        {
+            Sleep(50);
+            continue;
+        }
+
+        WORD buttons = state.Gamepad.wButtons;
+        WORD pressed = buttons & ~previousButtons;
+        int direction = GetVerticalNavigationDirection(state);
+
+        if (pressed & XINPUT_GAMEPAD_A)
+            return selected;
+
+        if (pressed & XINPUT_GAMEPAD_B)
+            return -1;
+
+        bool moved = ShouldMoveSelection(direction, &previousDirection, &nextRepeatTick);
+        if (moved)
+            selected += direction;
+
+        if (selected < 0)
+            selected = 0;
+
+        if (selected >= (int)items.size())
+            selected = (int)items.size() - 1;
+
+        if (moved)
+            RenderSimpleMenu(title, items, selected, footer);
+
+        previousButtons = buttons;
+        Sleep(50);
+    }
+}
+
+static bool ReadSettingsLines(std::vector<std::string> &lines)
+{
+    std::ifstream file(SETTINGS_FILE_PATH);
+    if (!file.is_open())
+        return false;
+
+    std::string line;
+    while (std::getline(file, line))
+    {
+        while (!line.empty() && (line[line.length() - 1] == '\r' || line[line.length() - 1] == '\n'))
+            line.resize(line.length() - 1);
+
+        lines.push_back(line);
+    }
+
+    return true;
+}
+
+static bool IsSettingLine(const std::string &line, const char *key)
+{
+    return !line.empty() && line[0] != '#' && line.compare(0, strlen(key), key) == 0;
+}
+
+// Last matching line wins, as in getSettings().
+static std::string ReadSetting(const char *key)
+{
+    std::vector<std::string> lines;
+    ReadSettingsLines(lines);
+
+    std::string value;
+    for (size_t i = 0; i < lines.size(); ++i)
+    {
+        if (IsSettingLine(lines[i], key))
+            value = lines[i].substr(strlen(key));
+    }
+
+    return value;
+}
+
+// The destination getSettings() will actually use, with the same fallbacks.
+static std::string GetEffectiveDestination(const DestinationSetting &setting, bool *isDefault)
+{
+    std::string value = ReadSetting(setting.key);
+    *isDefault = false;
+    if (value.length() >= 3)
+        return value;
+
+    *isDefault = true;
+    if (strcmp(setting.key, SETTING_TEMP_PATH) == 0)
+        return DEFAULT_TEMP_PATH;
+
+    std::string legacy = ReadSetting(SETTING_LEGACY_OUTPUT_PATH);
+    return legacy.length() >= 3 ? legacy : std::string("(not set)");
+}
+
+// Replaces every line of this key (or appends one) and keeps all other lines.
+static bool WriteSetting(const char *key, const std::string &value)
+{
+    std::vector<std::string> lines;
+    ReadSettingsLines(lines); // a missing file just starts empty
+
+    bool replaced = false;
+    for (size_t i = 0; i < lines.size(); ++i)
+    {
+        if (IsSettingLine(lines[i], key))
+        {
+            lines[i] = std::string(key) + value;
+            replaced = true;
+        }
+    }
+
+    if (!replaced)
+        lines.push_back(std::string(key) + value);
+
+    std::ofstream file(SETTINGS_FILE_PATH, std::ios::out | std::ios::trunc | std::ios::binary);
+    if (!file.is_open())
+        return false;
+
+    for (size_t i = 0; i < lines.size(); ++i)
+        file << lines[i] << "\r\n";
+
+    file.close();
+    return !file.fail();
+}
+
+static bool IsFolderWritable(const std::string &folder)
+{
+    std::string testFile = folder + "\\xstore_write_test.tmp";
+    FILE *fd = NULL;
+
+    if (fopen_s(&fd, testFile.c_str(), "w") != 0 || fd == NULL)
+        return false;
+
+    fclose(fd);
+    remove(testFile.c_str());
+    return true;
+}
+
+static void FormatFreeSpace(const char *drive, char *out, size_t outSize)
+{
+    ULARGE_INTEGER freeBytes;
+    std::string root = std::string(drive) + "\\";
+
+    if (GetDiskFreeSpaceEx(root.c_str(), &freeBytes, NULL, NULL))
+        _snprintf(out, outSize, "%.1f GB free", (double)freeBytes.QuadPart / (1024.0 * 1024.0 * 1024.0));
+    else
+        _snprintf(out, outSize, "free space unknown");
+
+    out[outSize - 1] = '\0';
+}
+
+static std::wstring ToWide(const std::string &text)
+{
+    std::wstring wide;
+    for (size_t i = 0; i < text.length(); ++i)
+        wide += (wchar_t)(unsigned char)text[i];
+
+    return wide;
+}
+
+// Forward slashes become backslashes, repeated and trailing separators and
+// surrounding spaces are removed.
+static std::string NormalizeDestinationPath(const std::string &input)
+{
+    std::string path;
+    for (size_t i = 0; i < input.length(); ++i)
+    {
+        char c = input[i] == '/' ? '\\' : input[i];
+        if (c == '\\' && !path.empty() && path[path.length() - 1] == '\\')
+            continue;
+
+        path += c;
+    }
+
+    size_t first = path.find_first_not_of(' ');
+    if (first == std::string::npos)
+        return std::string();
+
+    path = path.substr(first);
+    while (!path.empty() && (path[path.length() - 1] == ' ' || path[path.length() - 1] == '\\'))
+        path.resize(path.length() - 1);
+
+    return path;
+}
+
+static bool IsValidDestinationPath(const std::string &path)
+{
+    size_t colon = path.find(':');
+    if (colon == std::string::npos || colon == 0)
+        return false;
+
+    for (size_t i = 0; i < path.length(); ++i)
+    {
+        unsigned char c = (unsigned char)path[i];
+        if (c < 32 || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|')
+            return false;
+
+        if (c == ':' && i != colon)
+            return false;
+    }
+
+    size_t start = colon + 1;
+    while (start < path.length())
+    {
+        if (path[start] == '\\')
+        {
+            ++start;
+            continue;
+        }
+
+        size_t end = path.find('\\', start);
+        if (end == std::string::npos)
+            end = path.length();
+
+        if (end - start > FATX_MAX_NAME_LEN)
+            return false;
+
+        start = end + 1;
+    }
+
+    return true;
+}
+
+static void EditDestination(const DestinationSetting &setting)
+{
+    std::vector<std::string> drives;
+    std::vector<std::string> items;
+
+    for (int i = 0; i < CANDIDATE_DRIVE_COUNT; ++i)
+    {
+        if (!IsFolderWritable(CANDIDATE_DRIVES[i]))
+            continue;
+
+        char freeText[64];
+        FormatFreeSpace(CANDIDATE_DRIVES[i], freeText, sizeof(freeText));
+
+        drives.push_back(CANDIDATE_DRIVES[i]);
+        items.push_back(std::string(CANDIDATE_DRIVES[i]) + "  (" + freeText + ")");
+    }
+
+    if (drives.empty())
+    {
+        ClearConsole();
+        dprintf("No writable drive found. Connect a USB drive or check the hard drive, then try again.\n\nPress A to continue\n");
+        WaitForAPress();
+        return;
+    }
+
+    std::string title = std::string("Choose a drive for: ") + setting.label;
+    int choice = ShowSimpleMenu(title.c_str(), items, "A: Select   B: Back   D-Pad/Left Stick: Move");
+    if (choice < 0)
+        return;
+
+    // Keep the current folder (on the newly chosen drive), or suggest one.
+    bool isDefault = false;
+    std::string current = GetEffectiveDestination(setting, &isDefault);
+    std::string folder = setting.defaultFolder;
+    size_t colon = current.find(':');
+    if (!isDefault && colon != std::string::npos && colon + 1 < current.length())
+        folder = current.substr(colon + 1);
+
+    std::wstring suggestion = ToWide(drives[choice] + folder);
+    std::wstring keyboardTitle = ToWide(std::string("Folder for: ") + setting.label);
+
+    std::string typed;
+    DWORD keyboardResult = OpenKeyboardToString(
+        XUSER_INDEX_ANY,
+        &typed,
+        keyboardTitle.c_str(),
+        L"Full path, for example Hdd:\\Games\\Xbox 360. The folder is created if needed.",
+        suggestion.c_str());
+    if (keyboardResult != ERROR_SUCCESS || typed.empty())
+        return;
+
+    std::string path = NormalizeDestinationPath(typed);
+
+    ClearConsole();
+
+    if (!IsValidDestinationPath(path))
+    {
+        dprintf("Invalid path: %s\n\n"
+                "Use a drive followed by folders, for example Hdd:\\Games\\Xbox 360.\n"
+                "Folder names are limited to 42 characters and cannot contain * ? \" < > |\n\n"
+                "Press A to continue\n",
+                path.c_str());
+        WaitForAPress();
+        return;
+    }
+
+    if (customForceMkdir(path.c_str()) != EXIT_SUCCESS)
+        log_printf("Note: customForceMkdir(%s) failed, checking if the folder is usable anyway\n", path.c_str());
+
+    if (!IsFolderWritable(path))
+    {
+        dprintf("Cannot write to %s\n\nCheck that the drive is connected and not full.\n\nPress A to continue\n", path.c_str());
+        WaitForAPress();
+        return;
+    }
+
+    if (!WriteSetting(setting.key, path))
+    {
+        dprintf("Failed to save %s\n\nPress A to continue\n", SETTINGS_FILE_PATH);
+        WaitForAPress();
+        return;
+    }
+
+    dprintf("Saved. %s will now go to:\n%s\n", setting.label, path.c_str());
+    if (strcmp(setting.key, SETTING_TEMP_PATH) == 0)
+        dprintf("\nThis folder needs about twice the size of the game in free space.\n");
+
+    dprintf("\nPress A to continue\n");
+    WaitForAPress();
+}
+
+static void ShowSettingsMenu()
+{
+    while (true)
+    {
+        std::vector<std::string> items;
+
+        for (int i = 0; i < DESTINATION_SETTING_COUNT; ++i)
+        {
+            bool isDefault = false;
+            std::string value = GetEffectiveDestination(DESTINATION_SETTINGS[i], &isDefault);
+            items.push_back(std::string(DESTINATION_SETTINGS[i].label) + ": " + value + (isDefault ? "  (default)" : ""));
+        }
+
+        items.push_back("Back to main menu");
+
+        int choice = ShowSimpleMenu(
+            "Settings: download destinations\n\n"
+            "Saved in " SETTINGS_FILE_PATH ". The temporary folder needs about\n"
+            "twice the size of the game in free space.",
+            items,
+            "A: Change   B: Back   D-Pad/Left Stick: Move");
+
+        if (choice < 0 || choice >= DESTINATION_SETTING_COUNT)
+            return;
+
+        EditDestination(DESTINATION_SETTINGS[choice]);
+    }
+}
+
 std::vector<GameData> showUI()
 {
     Sleep(1000);
@@ -861,6 +1292,12 @@ main_UI_loop_start:
             if (runUpdate() != EXIT_FAILURE)
                 dprintf("Update Succeeded!\n");
             Sleep(500);
+            continue;
+        }
+
+        if (downloadType == SETTINGS_MENU)
+        {
+            ShowSettingsMenu();
             continue;
         }
 
